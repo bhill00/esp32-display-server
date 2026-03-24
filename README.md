@@ -13,6 +13,7 @@ After every Claude Code response, the display updates with:
 - **Context window usage** (progress bar, color-coded green/yellow/red)
 - **Project folder name** in the header
 - **Pixel-art Claude mascot** that does a double-bounce squish animation
+- **Multi-session aware** — the display updates for whichever session last responded, with the project folder name at the top showing which project is in focus
 
 ## Hardware
 
