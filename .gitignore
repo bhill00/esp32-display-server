@@ -1,5 +1,6 @@
 .pio/
 include/config.h
 *.bin
+!releases/*.bin
 __pycache__/
 *.pyc

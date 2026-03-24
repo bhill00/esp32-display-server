@@ -1,10 +1,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include "config.h"
+
+Preferences prefs;
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite fb = TFT_eSprite(&tft);
@@ -325,6 +329,192 @@ void handleBatch() {
   sendOk();
 }
 
+// ---- Dashboard helpers ----
+
+static const uint16_t C_BLACK   = TFT_BLACK;
+// Footer background — computed at runtime to avoid RGB565 conversion errors
+#define C_BG_FOOT parseColor("#0a0a15")
+
+uint16_t contextColor(float pct) {
+  if (pct < 0.5f) return parseColor("#00FF88");
+  if (pct < 0.75f) return parseColor("#F39C12");
+  return parseColor("#E74C3C");
+}
+
+// Format integer with commas: 123456 -> "123,456"
+void fmtComma(char* buf, int n) {
+  char tmp[24]; sprintf(tmp, "%d", n);
+  int len = strlen(tmp), out = 0, commas = (len - 1) / 3;
+  int lead = len - commas * 3;
+  for (int i = 0; i < len; i++) {
+    if (i == lead && i > 0) buf[out++] = ',';
+    else if (i > lead && (i - lead) % 3 == 0) buf[out++] = ',';
+    buf[out++] = tmp[i];
+  }
+  buf[out] = '\0';
+}
+
+// Format abbreviated: 1234 -> "1.2k", 1234567 -> "1.2M"
+void fmtK(char* buf, int n) {
+  if (n < 1000) { sprintf(buf, "%d", n); }
+  else if (n < 10000) { sprintf(buf, "%.1fk", n / 1000.0f); }
+  else if (n < 1000000) { sprintf(buf, "%dk", n / 1000); }
+  else { sprintf(buf, "%.1fM", n / 1000000.0f); }
+}
+
+void drawMascot(int squish) {
+  // Block-rect Claude mascot. ox,oy = top-left origin, sw/sh = block size
+  int ox = 170, oy = 48, sw = 4, sh = 7;
+  uint16_t col = parseColor("#D97757");
+  uint16_t blk = TFT_BLACK;
+
+  // Each squish state: list of (col, row) block coords + eye coords
+  // squish 0 = normal, 1 = slight, 2 = flat
+  struct { int c, r; } body0[] = {
+    {2,0},{3,0},{4,0},{5,0},{6,0},{7,0},{8,0},{9,0},{10,0},{11,0},
+    {2,1},{3,1},{4,1},{5,1},{6,1},{7,1},{8,1},{9,1},{10,1},{11,1},
+    {0,2},{1,2},{2,2},{3,2},{4,2},{5,2},{6,2},{7,2},{8,2},{9,2},{10,2},{11,2},{12,2},{13,2},
+    {2,3},{3,3},{4,3},{5,3},{6,3},{7,3},{8,3},{9,3},{10,3},{11,3},
+    {3,4},{5,4},{8,4},{10,4}
+  };
+  struct { int c, r; } eyes0[] = {{4,1},{9,1}};
+
+  struct { int c, r; } body1[] = {
+    {2,1},{3,1},{4,1},{5,1},{6,1},{7,1},{8,1},{9,1},{10,1},{11,1},
+    {0,2},{1,2},{2,2},{3,2},{4,2},{5,2},{6,2},{7,2},{8,2},{9,2},{10,2},{11,2},{12,2},{13,2},
+    {2,3},{3,3},{4,3},{5,3},{6,3},{7,3},{8,3},{9,3},{10,3},{11,3},
+    {2,4},{3,4},{4,4},{5,4},{6,4},{7,4},{8,4},{9,4},{10,4},{11,4}
+  };
+  struct { int c, r; } eyes1[] = {{4,2},{9,2}};
+
+  struct { int c, r; } body2[] = {
+    {0,2},{1,2},{2,2},{3,2},{4,2},{5,2},{6,2},{7,2},{8,2},{9,2},{10,2},{11,2},{12,2},{13,2},
+    {0,3},{1,3},{2,3},{3,3},{4,3},{5,3},{6,3},{7,3},{8,3},{9,3},{10,3},{11,3},{12,3},{13,3},
+    {0,4},{1,4},{2,4},{3,4},{4,4},{5,4},{6,4},{7,4},{8,4},{9,4},{10,4},{11,4},{12,4},{13,4}
+  };
+  struct { int c, r; } eyes2[] = {{4,2},{9,2}};
+
+  // clear mascot area
+  fb.fillRect(ox, oy, 14*sw, 5*sh, TFT_BLACK);
+
+  if (squish == 0) {
+    for (auto& b : body0) fb.fillRect(ox+b.c*sw, oy+b.r*sh, sw, sh, col);
+    for (auto& e : eyes0) fb.fillRect(ox+e.c*sw+1, oy+e.r*sh+1, sw-2, sh-2, blk);
+  } else if (squish == 1) {
+    for (auto& b : body1) fb.fillRect(ox+b.c*sw, oy+b.r*sh, sw, sh, col);
+    for (auto& e : eyes1) fb.fillRect(ox+e.c*sw+1, oy+e.r*sh+1, sw-2, sh-2, blk);
+  } else {
+    for (auto& b : body2) fb.fillRect(ox+b.c*sw, oy+b.r*sh, sw, sh, col);
+    for (auto& e : eyes2) fb.fillRect(ox+e.c*sw+1, oy+e.r*sh+1, sw-2, sh-2, blk);
+  }
+}
+
+void drawDashboardFrame(const char* project, const char* model,
+                        int turns, int ctx_used, int ctx_max) {
+  fb.fillSprite(TFT_BLACK);
+
+  // Header
+  char header[17]; strncpy(header, project[0] ? project : "Claude Session", 16); header[16] = '\0';
+  fb.setTextColor(parseColor("#7B68EE"), TFT_BLACK);
+  fb.setTextSize(2); fb.setTextFont(2);
+  fb.setCursor(10, 8); fb.print(header);
+
+  // Labels
+  fb.setTextColor(parseColor("#666666"), TFT_BLACK);
+  fb.setCursor(10, 88); fb.print("IN");
+  fb.setCursor(10, 122); fb.print("OUT");
+
+  // Turns
+  char tbuf[32]; sprintf(tbuf, "Turns: %d", turns);
+  fb.setTextColor(parseColor("#7B68EE"), TFT_BLACK);
+  fb.setCursor(10, 152); fb.print(tbuf);
+
+  // Context bar
+  float ctx_pct = ctx_max > 0 ? (float)ctx_used / ctx_max : 0.0f;
+  char ctxbuf[32]; char ckbuf[12]; char cmkbuf[12];
+  fmtK(ckbuf, ctx_used); fmtK(cmkbuf, ctx_max);
+  sprintf(ctxbuf, "Context %s/%s (%d%%)", ckbuf, cmkbuf, (int)(ctx_pct * 100));
+  fb.setTextColor(TFT_WHITE, TFT_BLACK);
+  fb.setTextSize(1); fb.setTextFont(2);
+  fb.setCursor(10, 182); fb.print(ctxbuf);
+
+  uint16_t barCol = contextColor(ctx_pct);
+  fb.fillRoundRect(10, 196, 220, 18, 6, parseColor("#1a1a2e"));
+  int bw = (int)(220 * ctx_pct);
+  if (bw > 0) fb.fillRoundRect(10, 196, bw, 18, 6, barCol);
+
+  // Footer
+  fb.fillRect(0, 224, 240, 16, C_BG_FOOT);
+  char footer[32]; sprintf(footer, "claude code | %s", model[0] ? model : "claude");
+  fb.setTextColor(TFT_WHITE, C_BG_FOOT);
+  fb.setCursor(30, 226); fb.print(footer);
+}
+
+void drawDashboardValues(float cost, int in_tok, int out_tok) {
+  char cbuf[16]; sprintf(cbuf, "$%.2f", cost);
+  char ibuf[20]; fmtComma(ibuf, in_tok);
+  char obuf[20]; fmtComma(obuf, out_tok);
+
+  // Clear value areas
+  fb.fillRect(5, 40, 160, 46, TFT_BLACK);
+  fb.fillRect(43, 85, 195, 34, TFT_BLACK);
+  fb.fillRect(58, 119, 180, 30, TFT_BLACK);
+
+  fb.setTextSize(3); fb.setTextFont(2);
+  fb.setTextColor(parseColor("#00FF88"), TFT_BLACK);
+  fb.setCursor(10, 45); fb.print(cbuf);
+
+  fb.setTextSize(2); fb.setTextFont(2);
+  fb.setTextColor(parseColor("#5DADE2"), TFT_BLACK);
+  fb.setCursor(45, 88); fb.print(ibuf);
+
+  fb.setTextColor(parseColor("#F39C12"), TFT_BLACK);
+  fb.setCursor(60, 122); fb.print(obuf);
+}
+
+void handleDashboard() {
+  if (server.method() != HTTP_POST) { sendErr("POST only"); return; }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) { sendErr("invalid json"); return; }
+
+  const char* project  = doc["project"]     | "";
+  const char* model    = doc["model"]       | "claude";
+  float  cost          = doc["cost"]        | 0.0f;
+  float  cost_prev     = doc["cost_prev"]   | 0.0f;
+  int    in_tok        = doc["in_tokens"]   | 0;
+  int    in_prev       = doc["in_prev"]     | 0;
+  int    out_tok       = doc["out_tokens"]  | 0;
+  int    out_prev      = doc["out_prev"]    | 0;
+  int    turns         = doc["turns"]       | 0;
+  int    ctx_used      = doc["context_used"]| 0;
+  int    ctx_max       = doc["context_max"] | 1000000;
+
+  // Respond immediately so hook can exit
+  sendOk();
+  server.client().stop();
+
+  // Draw static frame once
+  drawDashboardFrame(project, model, turns, ctx_used, ctx_max);
+  drawDashboardValues(cost_prev, in_prev, out_prev);
+  drawMascot(0);
+  fb.pushSprite(0, 0);
+
+  // Animate count-up + mascot squish
+  static const int squish_seq[] = {0,1,2,1,0,1,2,1,0,0};
+  int frames = 10;
+  for (int i = 1; i <= frames; i++) {
+    float frac = (float)i / frames;
+    float cur_cost = cost_prev + (cost - cost_prev) * frac;
+    int   cur_in   = (int)(in_prev  + (in_tok  - in_prev)  * frac);
+    int   cur_out  = (int)(out_prev + (out_tok  - out_prev) * frac);
+    drawDashboardValues(cur_cost, cur_in, cur_out);
+    drawMascot(squish_seq[i - 1]);
+    fb.pushSprite(0, 0);
+    if (i < frames) delay(80);
+  }
+}
+
 void handleStatus() {
   JsonDocument doc;
   doc["ip"] = WiFi.localIP().toString();
@@ -334,7 +524,7 @@ void handleStatus() {
   doc["height"] = 240;
   doc["uptime_s"] = millis() / 1000;
   doc["free_heap"] = ESP.getFreeHeap();
-  doc["version"] = "2.3-ota-test";
+  doc["version"] = FW_VERSION;
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -394,16 +584,23 @@ void setup() {
   tft.println("Connecting WiFi...");
   Serial.println("[display-server] Display initialized");
 
-  // WiFi connect
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("[display-server] Connecting to %s", WIFI_SSID);
+  // Load WiFi creds from NVS
+  prefs.begin("wifi", false);
+  String ssid = prefs.getString("ssid", "");
+  String pass = prefs.getString("pass", "");
+  prefs.end();
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+  // Try STA connection only if we have creds
+  if (ssid.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    Serial.printf("[display-server] Connecting to %s", ssid.c_str());
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -420,18 +617,78 @@ void setup() {
     tft.printf("RSSI: %d dBm\n", WiFi.RSSI());
     tft.printf("Port: %d\n", HTTP_PORT);
     tft.println();
-    tft.println("GET /help for API");
+    tft.printf("%s.local\n", MDNS_HOSTNAME);
+    tft.printf("v%s\n", FW_VERSION);
+
+    // mDNS
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+      Serial.printf("[display-server] mDNS: http://%s.local\n", MDNS_HOSTNAME);
+    }
   } else {
-    Serial.println("\n[display-server] WiFi FAILED");
-    tft.fillScreen(TFT_RED);
+    // No connection — start AP mode for configuration
+    Serial.println("\n[display-server] WiFi failed, starting AP mode");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-Display-Setup");
+
+    bool had_creds = ssid.length() > 0;
+
+    tft.fillScreen(TFT_BLACK);
     tft.setCursor(10, 10);
-    tft.setTextFont(4);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.println("WiFi Failed!");
     tft.setTextFont(2);
-    tft.printf("SSID: %s\n", WIFI_SSID);
-    tft.println("Check config.h");
-    return;  // Don't start server
+    // Title line — yellow if no creds, orange if creds failed
+    tft.setTextColor(had_creds ? TFT_ORANGE : TFT_YELLOW, TFT_BLACK);
+    tft.println(had_creds ? "WiFi Failed - Setup Mode" : "No WiFi Creds - Setup");
+    tft.println();
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    if (had_creds) {
+      tft.printf("Failed SSID:\n");
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.println(ssid.c_str());
+      tft.println();
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+    tft.println("1. Connect to:");
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.println("  ESP32-Display-Setup");
+    tft.println();
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.println("2. Open browser:");
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.println("  192.168.4.1");
+    tft.println();
+    tft.setTextColor(parseColor("#666666"), TFT_BLACK);
+    tft.printf("v%s\n", FW_VERSION);
+
+    // Serve config page in AP mode
+    server.on("/", HTTP_GET, []() {
+      server.send(200, "text/html",
+        "<h2>ESP32 Display Setup</h2>"
+        "<form method='POST' action='/wifi'>"
+        "SSID: <input name='ssid' length=32><br><br>"
+        "Password: <input name='pass' type='password' length=64><br><br>"
+        "<input type='submit' value='Save &amp; Connect'>"
+        "</form>");
+    });
+    server.on("/wifi", HTTP_POST, []() {
+      String new_ssid = server.arg("ssid");
+      String new_pass = server.arg("pass");
+      if (new_ssid.length() == 0) {
+        server.send(400, "text/plain", "SSID required");
+        return;
+      }
+      prefs.begin("wifi", false);
+      prefs.putString("ssid", new_ssid);
+      prefs.putString("pass", new_pass);
+      prefs.end();
+      server.send(200, "text/html",
+        "<h2>Saved!</h2><p>Rebooting to connect to <b>" + new_ssid + "</b>...</p>");
+      delay(1500);
+      ESP.restart();
+    });
+    server.begin();
+    Serial.println("[display-server] AP config server running");
+    // Loop forever in AP mode — reboot handles the rest
+    while (true) { server.handleClient(); delay(10); }
   }
 
   // Register routes
@@ -447,6 +704,30 @@ void setup() {
   server.on("/bar", HTTP_POST, handleBar);
   server.on("/brightness", HTTP_POST, handleBrightness);
   server.on("/batch", HTTP_POST, handleBatch);
+  server.on("/dashboard", HTTP_POST, handleDashboard);
+  server.on("/wifi", HTTP_POST, []() {
+    // Update WiFi credentials and reboot
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String new_ssid = doc["ssid"] | "";
+    String new_pass = doc["pass"] | "";
+    if (new_ssid.length() == 0) { sendErr("ssid required"); return; }
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", new_ssid);
+    prefs.putString("pass", new_pass);
+    prefs.end();
+    sendOk("saved, rebooting");
+    delay(500);
+    ESP.restart();
+  });
+  server.on("/wifi/clear", HTTP_POST, []() {
+    prefs.begin("wifi", false);
+    prefs.clear();
+    prefs.end();
+    sendOk("wifi creds cleared, rebooting");
+    delay(500);
+    ESP.restart();
+  });
 
   // OTA: POST firmware binary to /update, or GET /update for upload page
   server.on("/update", HTTP_POST, []() {

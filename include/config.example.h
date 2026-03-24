@@ -1,10 +1,5 @@
 #pragma once
 
-// ---- WiFi credentials ----
-// Copy this file to config.h and edit before flashing
-#define WIFI_SSID     "your-wifi-ssid"
-#define WIFI_PASSWORD "your-wifi-password"
-
 // ---- Display ----
 #define BACKLIGHT_PIN 13
 #define BACKLIGHT_PWM_CHANNEL 0
@@ -14,3 +9,9 @@
 
 // ---- HTTP Server ----
 #define HTTP_PORT 80
+
+// ---- Firmware version ----
+#define FW_VERSION "2.9-ap-mode"
+
+// ---- mDNS hostname ----
+#define MDNS_HOSTNAME "esp32-display"
