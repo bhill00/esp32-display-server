@@ -2,7 +2,7 @@
 
 A physical ambient display that shows real-time Claude Code session stats on a 240x240 TFT screen, powered by an ESP32-S3. Features animated token counters, cost tracking, context window usage, and a bouncy pixel-art Claude mascot.
 
-![Claude Code Display](https://img.shields.io/badge/ESP32--S3-Claude_Code-D97757)
+![Claude Code Display](claudebb.jpg)
 
 ## What it does
 
@@ -18,6 +18,7 @@ After every Claude Code response, the display updates with:
 
 - **ESP32-S3 Super Mini** (with 2MB PSRAM)
 - **1.54" ST7789 240x240 TFT display**
+- **3D printed case** from [BambuHelper by Keralots](https://github.com/Keralots/BambuHelper) (designed for a Bambu Lab printer monitor, works great as a general-purpose ESP32 display enclosure)
 
 ### Wiring
 
