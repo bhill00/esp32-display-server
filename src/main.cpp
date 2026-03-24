@@ -14,6 +14,58 @@ TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite fb = TFT_eSprite(&tft);
 WebServer server(HTTP_PORT);
 
+// ---- Screensaver state ----
+#define SS_IDLE_MS    (5UL * 60 * 1000)  // 5 minutes
+#define SS_FRAME_MS   40                  // ~25fps
+#define MASCOT_W      56                  // 14 cols * 4px
+#define MASCOT_H      35                  // 5 rows  * 7px
+#define TRAIL_SEGS    6                   // one ghost per rainbow color
+#define STAR_COUNT    30                  // background stars
+#define RAINBOW_BANDS 6                   // must match TRAIL_SEGS
+
+unsigned long lastDashboardMs = 0;
+bool          ssActive        = false;
+
+// Position & velocity
+float ssX = 92.0f, ssY = 102.0f;
+float ssDx = 1.3f, ssDy = 0.9f;
+
+// Continuous squish cycle
+int   ssSqFrame    = 0;
+int   ssSqTick     = 0;
+static const int SS_SQUISH_CYCLE[] = {0,0,0,0,1,2,1,0};
+static const int SS_SQUISH_CYCLE_LEN = 8;
+
+// Squish on bounce
+int   ssBounceFrames = 0;
+static const int SS_BOUNCE_SEQ[]  = {1,2,2,1,0};
+static const int SS_BOUNCE_LEN    = 5;
+
+// Trail: circular buffer of past positions
+struct TrailPos { int x, y; };
+TrailPos ssTrail[TRAIL_SEGS];
+int      ssTrailHead  = 0;
+bool     ssTrailFull  = false;
+int      ssSampleTick = 0;
+int      ssColorOff   = 0;  // cycles each frame to shift rainbow along tail
+#define  TRAIL_SAMPLE 8     // sample position every N frames (~20px spacing)
+
+// Stars
+struct Star { int x, y; uint16_t col; };
+Star ssStars[STAR_COUNT];
+
+// Rainbow stripe colors (RGB565) — R,O,Y,G,B,V
+static const uint16_t RAINBOW[RAINBOW_BANDS] = {
+  0xF800, // red
+  0xFC60, // orange
+  0xFFE0, // yellow
+  0x07E0, // green
+  0x001F, // blue
+  0x781F, // violet
+};
+
+unsigned long ssLastFrameMs = 0;
+
 // ---- Helpers ----
 
 uint16_t parseColor(const char* hex) {
@@ -335,6 +387,17 @@ static const uint16_t C_BLACK   = TFT_BLACK;
 // Footer background — computed at runtime to avoid RGB565 conversion errors
 #define C_BG_FOOT parseColor("#0a0a15")
 
+// Scale RGB565 color brightness: scale 0.0=black, 1.0=full
+uint16_t dimColor(uint16_t col, float scale) {
+  uint8_t r = ((col >> 11) & 0x1F);
+  uint8_t g = ((col >> 5)  & 0x3F);
+  uint8_t b = ( col        & 0x1F);
+  r = (uint8_t)(r * scale);
+  g = (uint8_t)(g * scale);
+  b = (uint8_t)(b * scale);
+  return (r << 11) | (g << 5) | b;
+}
+
 uint16_t contextColor(float pct) {
   if (pct < 0.5f) return parseColor("#00FF88");
   if (pct < 0.75f) return parseColor("#F39C12");
@@ -362,10 +425,9 @@ void fmtK(char* buf, int n) {
   else { sprintf(buf, "%.1fM", n / 1000000.0f); }
 }
 
-void drawMascot(int squish) {
-  // Block-rect Claude mascot. ox,oy = top-left origin, sw/sh = block size
-  int ox = 170, oy = 48, sw = 4, sh = 7;
-  uint16_t col = parseColor("#D97757");
+void drawMascotAt(int ox, int oy, int squish, uint16_t col = 0, bool clearBg = true) {
+  int sw = 4, sh = 7;
+  if (col == 0) col = parseColor("#D97757");
   uint16_t blk = TFT_BLACK;
 
   // Each squish state: list of (col, row) block coords + eye coords
@@ -394,8 +456,8 @@ void drawMascot(int squish) {
   };
   struct { int c, r; } eyes2[] = {{4,2},{9,2}};
 
-  // clear mascot area
-  fb.fillRect(ox, oy, 14*sw, 5*sh, TFT_BLACK);
+  // clear mascot area (skip for ghost trail copies)
+  if (clearBg) fb.fillRect(ox, oy, 14*sw, 5*sh, TFT_BLACK);
 
   if (squish == 0) {
     for (auto& b : body0) fb.fillRect(ox+b.c*sw, oy+b.r*sh, sw, sh, col);
@@ -407,6 +469,113 @@ void drawMascot(int squish) {
     for (auto& b : body2) fb.fillRect(ox+b.c*sw, oy+b.r*sh, sw, sh, col);
     for (auto& e : eyes2) fb.fillRect(ox+e.c*sw+1, oy+e.r*sh+1, sw-2, sh-2, blk);
   }
+}
+
+// Dashboard uses fixed position
+void drawMascot(int squish) { drawMascotAt(170, 48, squish); }
+
+// ---- Screensaver ----
+
+void drawNyanFrame() {
+  fb.fillSprite(TFT_BLACK);
+
+  // Twinkle stars
+  for (int i = 0; i < 4; i++) {
+    int idx = random(0, STAR_COUNT);
+    int r = random(0, 3);
+    if (r == 0)      ssStars[idx].col = TFT_WHITE;
+    else if (r == 1) ssStars[idx].col = 0x4208;
+    else             ssStars[idx].col = TFT_BLACK;
+  }
+  for (int i = 0; i < STAR_COUNT; i++) {
+    fb.fillRect(ssStars[i].x, ssStars[i].y, 2, 2, ssStars[i].col);
+  }
+
+  // Draw ghost trail — oldest first so newer ones paint over
+  // Color offset shifts each frame so colors cycle along the tail (Mario Kart rainbow road)
+  int trailCount = ssTrailFull ? TRAIL_SEGS : ssTrailHead;
+  for (int s = trailCount - 1; s >= 0; s--) {
+    int idx = (ssTrailHead - 1 - s + TRAIL_SEGS) % TRAIL_SEGS;
+    // s=0 newest, s=trailCount-1 oldest
+    // Color cycles: add ssColorOff so the whole tail shifts each frame
+    uint16_t col = RAINBOW[(RAINBOW_BANDS - 1 - s + ssColorOff) % RAINBOW_BANDS];
+    float brightness = 1.0f - (float)s / TRAIL_SEGS * 0.85f;  // 100% newest -> 15% oldest
+    col = dimColor(col, brightness);
+    drawMascotAt(ssTrail[idx].x, ssTrail[idx].y, 0, col, false);
+  }
+
+  // Advance squish
+  int squish;
+  if (ssBounceFrames > 0) {
+    squish = SS_BOUNCE_SEQ[SS_BOUNCE_LEN - ssBounceFrames];
+    ssBounceFrames--;
+  } else {
+    ssSqTick++;
+    if (ssSqTick >= 3) { ssSqTick = 0; ssSqFrame = (ssSqFrame + 1) % SS_SQUISH_CYCLE_LEN; }
+    squish = SS_SQUISH_CYCLE[ssSqFrame];
+  }
+
+  // Draw main mascot (Claude orange) on top
+  drawMascotAt((int)ssX, (int)ssY, squish, 0, false);
+  fb.pushSprite(0, 0);
+}
+
+void tickScreensaver() {
+  unsigned long now = millis();
+  if (now - ssLastFrameMs < SS_FRAME_MS) return;
+  ssLastFrameMs = now;
+
+  // Sample position into trail buffer every N frames for visible spacing
+  ssSampleTick++;
+  if (ssSampleTick >= TRAIL_SAMPLE) {
+    ssSampleTick = 0;
+    ssTrail[ssTrailHead] = {(int)ssX, (int)ssY};
+    ssTrailHead = (ssTrailHead + 1) % TRAIL_SEGS;
+    if (ssTrailHead == 0) ssTrailFull = true;
+  }
+
+  // Advance color offset every 2 frames
+  static int ssColorTick = 0;
+  if (++ssColorTick >= 2) { ssColorTick = 0; ssColorOff = (ssColorOff + 1) % RAINBOW_BANDS; }
+
+  // Move
+  ssX += ssDx;
+  ssY += ssDy;
+
+  // Bounce
+  if (ssX <= 0)              { ssX = 0;               ssDx = fabsf(ssDx);  ssBounceFrames = SS_BOUNCE_LEN; }
+  if (ssX >= 240 - MASCOT_W) { ssX = 240 - MASCOT_W;  ssDx = -fabsf(ssDx); ssBounceFrames = SS_BOUNCE_LEN; }
+  if (ssY <= 0)              { ssY = 0;               ssDy = fabsf(ssDy);  ssBounceFrames = SS_BOUNCE_LEN; }
+  if (ssY >= 240 - MASCOT_H) { ssY = 240 - MASCOT_H;  ssDy = -fabsf(ssDy); ssBounceFrames = SS_BOUNCE_LEN; }
+
+  drawNyanFrame();
+}
+
+void startScreensaver() {
+  ssActive       = true;
+  ssTrailHead    = 0;
+  ssTrailFull    = false;
+  ssSampleTick   = 0;
+  ssColorOff     = 0;
+  ssSqFrame      = 0;
+  ssSqTick       = 0;
+  ssBounceFrames = 0;
+
+  // Scatter stars randomly across the screen
+  for (int i = 0; i < STAR_COUNT; i++) {
+    ssStars[i].x   = random(0, 238);
+    ssStars[i].y   = random(0, 238);
+    // Stars twinkle between white and light grey
+    ssStars[i].col = (random(0, 2) == 0) ? TFT_WHITE : 0xC618;
+  }
+
+  fb.fillSprite(TFT_BLACK);
+  fb.pushSprite(0, 0);
+  ssLastFrameMs = millis();
+}
+
+void stopScreensaver() {
+  ssActive = false;
 }
 
 void drawDashboardFrame(const char* project, const char* model,
@@ -493,6 +662,9 @@ void handleDashboard() {
   // Respond immediately so hook can exit
   sendOk();
   server.client().stop();
+
+  lastDashboardMs = millis();
+  stopScreensaver();
 
   // Draw static frame once
   drawDashboardFrame(project, model, turns, ctx_used, ctx_max);
@@ -720,6 +892,10 @@ void setup() {
     delay(500);
     ESP.restart();
   });
+  server.on("/screensaver", HTTP_POST, []() {
+    startScreensaver();
+    sendOk("screensaver started");
+  });
   server.on("/wifi/clear", HTTP_POST, []() {
     prefs.begin("wifi", false);
     prefs.clear();
@@ -761,5 +937,14 @@ void setup() {
 void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     server.handleClient();
+  }
+
+  // Auto-start screensaver after idle timeout
+  if (!ssActive && (millis() > SS_IDLE_MS) && (lastDashboardMs == 0 || (millis() - lastDashboardMs > SS_IDLE_MS))) {
+    startScreensaver();
+  }
+
+  if (ssActive) {
+    tickScreensaver();
   }
 }

@@ -15,6 +15,7 @@ After every Claude Code response, the display updates with:
 - **Current model** in the footer (updates dynamically as you switch models)
 - **Pixel-art Claude mascot** that does a double-bounce squish animation
 - **Multi-session aware** — updates for whichever session last responded
+- **Nyan Cat screensaver** — after 5 minutes idle, Claude bounces around the screen with a rainbow ghost trail and twinkling stars. Triggered automatically or via `POST /screensaver`.
 
 ## Hardware
 
@@ -68,7 +69,7 @@ No toolchain needed. Grab the latest merged binary from the `releases/` folder a
 1. Connect ESP32-S3 via USB
 2. Open [https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)
 3. **Erase flash** first
-4. Flash `releases/firmware-2.9-ap-mode-merged.bin` at address `0x0`
+4. Flash `releases/firmware-4.0-nyan-merged.bin` at address `0x0`
 5. Unplug USB (important — usbipd can prevent boot on WSL2)
 6. Power on — the display will show WiFi setup instructions
 
@@ -180,6 +181,7 @@ curl -F "firmware=@.pio/build/esp32s3/firmware-<version>.bin" http://esp32-displ
 | `/bar` | POST | Horizontal progress bar |
 | `/gauge` | POST | Circular gauge |
 | `/brightness` | POST | Set backlight (0-255) |
+| `/screensaver` | POST | Start nyan screensaver immediately |
 | `/wifi` | POST | Update WiFi credentials: `{"ssid":"x","pass":"y"}` |
 | `/wifi/clear` | POST | Wipe credentials, reboot into AP mode |
 | `/update` | GET/POST | OTA firmware upload |
