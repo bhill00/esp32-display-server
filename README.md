@@ -2,7 +2,7 @@
 
 A physical ambient display that shows real-time Claude Code session stats on a 240x240 TFT screen, powered by an ESP32-S3. Features animated token counters, cost tracking, context window usage, and a bouncy pixel-art Claude mascot.
 
-![Claude Code Display](claudebb.jpg)
+![Claude Code Display](cc-bot.jpg)
 
 ## What it does
 
