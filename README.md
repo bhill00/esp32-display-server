@@ -55,6 +55,7 @@ Claude Code
     |
     |-- MCP Server (mcp_server.py)
     |       Exposes drawing tools so Claude can draw on the display
+    |       pause_display / resume_display to hold drawings between hook fires
     |
     v
 ESP32-S3 Firmware (main.cpp)
@@ -222,6 +223,34 @@ Token costs are calculated per-model from the transcript:
 | Claude Haiku 4.5 | $1/M | $5/M | $1.25/M | $0.10/M |
 
 Mixed-model sessions are billed accurately per turn. The displayed IN token count is normalized to a billed-equivalent value so it correlates with the dollar amount shown.
+
+## Drawing with Claude
+
+Once the MCP server is configured, just ask Claude in natural language:
+
+- *"Draw a red circle in the center of the screen"*
+- *"Pause dashboard updates and draw a smiley face"*
+- *"Resume dashboard updates"*
+- *"What's the display status?"*
+
+The MCP server exposes these tools:
+
+| Tool | Description |
+|------|-------------|
+| `display_clear` | Fill screen with a color |
+| `display_text` | Draw text at x,y |
+| `display_rect` | Draw a rectangle |
+| `display_circle` | Draw a circle |
+| `display_line` | Draw a line |
+| `display_bar` | Horizontal progress bar |
+| `display_gauge` | Circular gauge |
+| `display_batch` | Multiple commands, flicker-free |
+| `display_brightness` | Set backlight level |
+| `display_status` | Get device status |
+| `pause_display` | Pause Stop hook updates so drawings persist |
+| `resume_display` | Resume automatic dashboard updates |
+
+`pause_display` / `resume_display` work by creating/deleting `/tmp/esp32_display_paused`. When paused, the Stop hook skips posting to `/dashboard` so your drawing stays on screen indefinitely.
 
 ## Customization
 
