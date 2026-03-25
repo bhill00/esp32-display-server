@@ -822,6 +822,16 @@ void invReset() {
 void drawInvadersFrame() {
   fb.fillSprite(TFT_BLACK);
 
+  // Parallax starfield (same as nyan/drift)
+  for (int l = 0; l < STAR_LAYERS; l++) {
+    for (int i = 0; i < STARS_PER_LAYER; i++) {
+      ssStars[l][i].x -= STAR_SPEED[l];
+      if (ssStars[l][i].x < 0) ssStars[l][i].x += 240.0f;
+      uint16_t col = (random(0, 20) == 0) ? dimColor(STAR_BRIGHT[l], 0.3f) : STAR_BRIGHT[l];
+      fb.fillRect((int)ssStars[l][i].x, ssStars[l][i].y, STAR_SIZE[l], STAR_SIZE[l], col);
+    }
+  }
+
   // --- Game over screen ---
   if (invGameOver) {
     fb.setTextSize(2); fb.setTextFont(1);
