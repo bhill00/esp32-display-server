@@ -100,25 +100,30 @@ WiFi credentials are stored in NVS (non-volatile storage) and survive firmware u
 
 ### 1. MCP Server
 
+The MCP server lets Claude draw on the display on demand. It's optional — the dashboard hook works without it.
+
 Requires Python 3 with `requests` and `mcp` packages:
 
 ```bash
 pip install requests mcp
 ```
 
-Add to your Claude Code MCP config (`~/.claude/.mcp.json` for global, or `.mcp.json` in project root):
+Register it user-wide (works in all projects):
 
-```json
-{
-  "mcpServers": {
-    "esp32-display": {
-      "type": "stdio",
-      "command": "python3",
-      "args": ["/path/to/esp32-display-server/mcp_server.py"]
-    }
-  }
-}
+```bash
+claude mcp add --scope user esp32-display --transport stdio -- python3 /path/to/esp32-display-server/mcp_server.py
 ```
+
+Verify it's registered:
+
+```bash
+claude mcp list
+```
+
+Once registered, just ask Claude in a new session:
+
+> *"Pause dashboard updates and draw a cat"*
+> *"Resume dashboard updates"*
 
 ### 2. Dashboard Hook
 
