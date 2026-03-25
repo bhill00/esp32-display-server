@@ -11,11 +11,19 @@ After every Claude Code response, the display updates with:
 - **Billed-equivalent input/output token counts** (animated)
 - **Turn counter**
 - **Context window usage** (progress bar, color-coded green/yellow/red)
-- **Project folder name** in the header
+- **Project folder name** in the header (scrolls if too long, or truncates — configurable)
 - **Current model** in the footer (updates dynamically as you switch models)
 - **Pixel-art Claude mascot** that does a double-bounce squish animation
 - **Multi-session aware** — updates for whichever session last responded
-- **Nyan Cat screensaver** — after 5 minutes idle, Claude bounces around the screen with a rainbow ghost trail and twinkling stars. Triggered automatically or via `POST /screensaver`.
+
+### Screensavers
+
+Two screensaver modes trigger after a configurable idle timeout (default 5 minutes):
+
+- **Nyan** — Claude bounces around the screen DVD-logo style with a fixed-length rainbow ghost trail, parallax starfield, and random UFO flybys
+- **Drift** — Claude tumbles through space with continuous rotation and depth scaling (bounces toward/away from you in a 3D illusion)
+
+Screensaver mode, idle timeout, and all display preferences are configurable via the web UI at `http://esp32-display.local/settings`.
 
 ## Hardware
 
@@ -52,6 +60,7 @@ Claude Code
 ESP32-S3 Firmware (main.cpp)
     |-- HTTP server on port 80
     |-- /dashboard endpoint: receives stats, runs animation onboard
+    |-- /settings web UI: screensaver, header, WiFi config
     |-- Drawing primitives: text, rect, circle, line, bar, gauge
     |-- /batch endpoint with PSRAM framebuffer (flicker-free)
     |-- /update endpoint for OTA firmware updates
@@ -69,7 +78,7 @@ No toolchain needed. Grab the latest merged binary from the `releases/` folder a
 1. Connect ESP32-S3 via USB
 2. Open [https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)
 3. **Erase flash** first
-4. Flash `releases/firmware-4.0-nyan-merged.bin` at address `0x0`
+4. Flash `releases/firmware-5.1-nyan-merged.bin` at address `0x0`
 5. Unplug USB (important — usbipd can prevent boot on WSL2)
 6. Power on — the display will show WiFi setup instructions
 
@@ -83,8 +92,6 @@ On first boot the ESP32 starts a setup hotspot:
 4. The device reboots and connects — the IP and `esp32-display.local` are shown on the display
 
 WiFi credentials are stored in NVS (non-volatile storage) and survive firmware updates.
-
-To reset credentials: `curl -X POST http://esp32-display.local/wifi/clear`
 
 ---
 
@@ -141,6 +148,22 @@ By default `update_display.py` tries `esp32-display.local` first and falls back 
 
 ---
 
+## Settings
+
+Visit `http://esp32-display.local/settings` in any browser to configure:
+
+| Setting | Options |
+|---------|---------|
+| Screensaver mode | Nyan / Drift / Disabled |
+| Idle timeout | Minutes (0 = never) |
+| Long folder names | Scroll / Truncate |
+| WiFi credentials | SSID + password |
+| Clear WiFi | Wipe creds, reboot to AP mode |
+
+All settings are saved to NVS and persist across reboots and OTA updates. Changes take effect immediately — no reboot needed (except WiFi credential changes).
+
+---
+
 ## Building from Source
 
 Install [PlatformIO](https://platformio.org/).
@@ -158,9 +181,10 @@ pio run --target clean && pio run
 
 ### OTA Updates (after first flash)
 
+Visit `http://esp32-display.local/update` in your browser and upload the firmware bin, or:
+
 ```bash
 curl -F "firmware=@.pio/build/esp32s3/firmware-<version>.bin" http://esp32-display.local/update
-# or visit http://esp32-display.local/update in your browser
 ```
 
 ---
@@ -171,6 +195,7 @@ curl -F "firmware=@.pio/build/esp32s3/firmware-<version>.bin" http://esp32-displ
 |----------|--------|-------------|
 | `/status` | GET | Device info (IP, RSSI, uptime, version) |
 | `/help` | GET | API documentation |
+| `/settings` | GET/POST | Web UI for all device settings |
 | `/dashboard` | POST | Full session stats — ESP animates the display |
 | `/batch` | POST | Multiple draw commands, framebuffered |
 | `/clear` | POST | Fill screen with color |
@@ -181,7 +206,7 @@ curl -F "firmware=@.pio/build/esp32s3/firmware-<version>.bin" http://esp32-displ
 | `/bar` | POST | Horizontal progress bar |
 | `/gauge` | POST | Circular gauge |
 | `/brightness` | POST | Set backlight (0-255) |
-| `/screensaver` | POST | Start nyan screensaver immediately |
+| `/screensaver` | POST | Trigger screensaver: `{"mode":"nyan"}` or `{"mode":"drift"}` |
 | `/wifi` | POST | Update WiFi credentials: `{"ssid":"x","pass":"y"}` |
 | `/wifi/clear` | POST | Wipe credentials, reboot into AP mode |
 | `/update` | GET/POST | OTA firmware upload |
