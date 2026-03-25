@@ -15,16 +15,32 @@ TFT_eSprite fb = TFT_eSprite(&tft);
 WebServer server(HTTP_PORT);
 
 // ---- Screensaver state ----
-#define SS_IDLE_MS    (5UL * 60 * 1000)  // 5 minutes
 #define SS_FRAME_MS   40                  // ~25fps
 #define MASCOT_W      56                  // 14 cols * 4px
 #define MASCOT_H      35                  // 5 rows  * 7px
 #define TRAIL_SEGS    6                   // one ghost per rainbow color
-#define STAR_COUNT    30                  // background stars
+#define STAR_COUNT    20                  // kept for size compat, replaced by STARS_PER_LAYER
 #define RAINBOW_BANDS 6                   // must match TRAIL_SEGS
 
 unsigned long lastDashboardMs = 0;
 bool          ssActive        = false;
+
+// Header scroll state
+#define HDR_ICON_W   26   // folder icon + gap, text starts here
+#define HDR_TEXT_W  209   // 235 - HDR_ICON_W, available text width
+#define HDR_H        32   // header row height — tall enough for font2 textSize2 (~26px) + top offset
+#define HDR_TEXT_Y    2   // y offset for text within header row (static and scroll must match)
+#define HDR_SCROLL_MS 30  // ms per pixel scroll
+char          hdrProject[64]   = "";
+int           hdrTextPxW       = 0;     // pixel width of full project string
+bool          hdrNeedsScroll   = false;
+float         hdrScrollX       = 0.0f;  // current scroll offset (0 = start)
+unsigned long hdrLastScrollMs  = 0;
+
+enum SsMode { SS_NYAN, SS_DRIFT, SS_OFF };
+SsMode ssMode       = SS_NYAN;
+unsigned long ssIdleMs    = 5UL * 60 * 1000;  // idle timeout, 0 = never
+bool          hdrScrollEnabled = true;          // false = truncate long names
 
 // Position & velocity
 float ssX = 92.0f, ssY = 102.0f;
@@ -41,18 +57,42 @@ int   ssBounceFrames = 0;
 static const int SS_BOUNCE_SEQ[]  = {1,2,2,1,0};
 static const int SS_BOUNCE_LEN    = 5;
 
-// Trail: circular buffer of past positions
-struct TrailPos { int x, y; };
+// Drift mode: rotation + depth
+float ssDriftAngle  = 0.0f;   // degrees, increments each frame
+float ssDriftScale  = 1.0f;   // 0.25 (far) .. 1.0 (close)
+int   ssBounceCount = 0;      // total bounces since last direction change
+int   ssDriftDir    = -1;     // -1 shrinking (going away), +1 growing (coming toward)
+#define DRIFT_SHRINK_BOUNCES  4
+#define DRIFT_GROW_BOUNCES    8
+#define DRIFT_SCALE_MIN  0.25f
+#define DRIFT_SCALE_MAX  1.0f
+
+// Trail: circular buffer of past positions, each ghost keeps its assigned color
+struct TrailPos { int x, y; uint16_t color; };
 TrailPos ssTrail[TRAIL_SEGS];
 int      ssTrailHead  = 0;
 bool     ssTrailFull  = false;
 int      ssSampleTick = 0;
-int      ssColorOff   = 0;  // cycles each frame to shift rainbow along tail
+int      ssColorOff   = 0;  // advances by 1 each time a new ghost is born
 #define  TRAIL_SAMPLE 8     // sample position every N frames (~20px spacing)
 
-// Stars
-struct Star { int x, y; uint16_t col; };
-Star ssStars[STAR_COUNT];
+// Parallax starfield — 3 layers, each scrolling at different speeds
+#define STAR_LAYERS   3
+#define STARS_PER_LAYER 20
+
+struct Star { float x; int y; };  // float x for sub-pixel scroll
+
+// Layer config: speed (px/frame), size (px), brightness
+static const float  STAR_SPEED[STAR_LAYERS]  = { 0.2f, 0.5f, 1.1f };
+static const int    STAR_SIZE[STAR_LAYERS]   = { 1,    1,    2    };
+static const uint16_t STAR_BRIGHT[STAR_LAYERS] = { 0x4208, 0x8410, 0xFFFF }; // dim, mid, bright
+
+Star ssStars[STAR_LAYERS][STARS_PER_LAYER];
+
+// UFO flyby
+struct Ufo { float x; int y; bool active; float speed; };
+Ufo ssUfo = { 0, 0, false, 0 };
+unsigned long ssUfoNextMs = 0;  // when to spawn next UFO
 
 // Rainbow stripe colors (RGB565) — R,O,Y,G,B,V
 static const uint16_t RAINBOW[RAINBOW_BANDS] = {
@@ -425,8 +465,9 @@ void fmtK(char* buf, int n) {
   else { sprintf(buf, "%.1fM", n / 1000000.0f); }
 }
 
-void drawMascotAt(int ox, int oy, int squish, uint16_t col = 0, bool clearBg = true) {
-  int sw = 4, sh = 7;
+void drawMascotAt(int ox, int oy, int squish, uint16_t col = 0, bool clearBg = true, float scale = 1.0f) {
+  int sw = max(1, (int)(4 * scale));
+  int sh = max(1, (int)(7 * scale));
   if (col == 0) col = parseColor("#D97757");
   uint16_t blk = TFT_BLACK;
 
@@ -479,40 +520,60 @@ void drawMascot(int squish) { drawMascotAt(170, 48, squish); }
 void drawNyanFrame() {
   fb.fillSprite(TFT_BLACK);
 
-  // Twinkle stars
-  for (int i = 0; i < 4; i++) {
-    int idx = random(0, STAR_COUNT);
-    int r = random(0, 3);
-    if (r == 0)      ssStars[idx].col = TFT_WHITE;
-    else if (r == 1) ssStars[idx].col = 0x4208;
-    else             ssStars[idx].col = TFT_BLACK;
+  // Scroll and draw parallax star layers
+  for (int l = 0; l < STAR_LAYERS; l++) {
+    for (int i = 0; i < STARS_PER_LAYER; i++) {
+      ssStars[l][i].x -= STAR_SPEED[l];
+      if (ssStars[l][i].x < 0) ssStars[l][i].x += 240.0f;  // wrap
+      // Subtle twinkle: 1 in 20 chance of dimming slightly
+      uint16_t col = (random(0, 20) == 0) ? dimColor(STAR_BRIGHT[l], 0.3f) : STAR_BRIGHT[l];
+      fb.fillRect((int)ssStars[l][i].x, ssStars[l][i].y, STAR_SIZE[l], STAR_SIZE[l], col);
+    }
   }
-  for (int i = 0; i < STAR_COUNT; i++) {
-    fb.fillRect(ssStars[i].x, ssStars[i].y, 2, 2, ssStars[i].col);
+
+  // UFO flyby
+  unsigned long now2 = millis();
+  if (!ssUfo.active && now2 >= ssUfoNextMs) {
+    ssUfo.active = true;
+    ssUfo.x      = 245.0f;  // start just off right edge
+    ssUfo.y      = random(10, 220);
+    ssUfo.speed  = 1.5f + random(0, 20) * 0.1f;  // 1.5–3.5 px/frame
+  }
+  if (ssUfo.active) {
+    ssUfo.x -= ssUfo.speed;
+    if (ssUfo.x < -30) {
+      ssUfo.active  = false;
+      ssUfoNextMs   = now2 + 15000 + random(0, 20000);  // 15–35s until next
+    } else {
+      int ux = (int)ssUfo.x, uy = ssUfo.y;
+      // Body: 12x5 cyan oval-ish
+      fb.fillRect(ux+2, uy,   8, 2, 0x07FF); // top dome
+      fb.fillRect(ux,   uy+2, 12, 3, 0x07FF); // main body
+      // Dome highlight
+      fb.fillRect(ux+4, uy,   4, 2, 0xFFFF);
+      // Underside lights — alternating yellow/red
+      fb.fillRect(ux+1,  uy+5, 2, 1, 0xFFE0);
+      fb.fillRect(ux+5,  uy+5, 2, 1, 0xF800);
+      fb.fillRect(ux+9,  uy+5, 2, 1, 0xFFE0);
+    }
   }
 
   // Draw ghost trail — oldest first so newer ones paint over
-  // Color offset shifts each frame so colors cycle along the tail (Mario Kart rainbow road)
+  // Each ghost keeps its birth color, just dims with age
   int trailCount = ssTrailFull ? TRAIL_SEGS : ssTrailHead;
   for (int s = trailCount - 1; s >= 0; s--) {
     int idx = (ssTrailHead - 1 - s + TRAIL_SEGS) % TRAIL_SEGS;
     // s=0 newest, s=trailCount-1 oldest
-    // Color cycles: add ssColorOff so the whole tail shifts each frame
-    uint16_t col = RAINBOW[(RAINBOW_BANDS - 1 - s + ssColorOff) % RAINBOW_BANDS];
-    float brightness = 1.0f - (float)s / TRAIL_SEGS * 0.85f;  // 100% newest -> 15% oldest
-    col = dimColor(col, brightness);
+    float brightness = 1.0f - (float)s / (float)TRAIL_SEGS * 0.85f;  // 100% -> 15%
+    uint16_t col = dimColor(ssTrail[idx].color, brightness);
     drawMascotAt(ssTrail[idx].x, ssTrail[idx].y, 0, col, false);
   }
 
-  // Advance squish
-  int squish;
+  // Squish only on edge bounce
+  int squish = 0;
   if (ssBounceFrames > 0) {
     squish = SS_BOUNCE_SEQ[SS_BOUNCE_LEN - ssBounceFrames];
     ssBounceFrames--;
-  } else {
-    ssSqTick++;
-    if (ssSqTick >= 3) { ssSqTick = 0; ssSqFrame = (ssSqFrame + 1) % SS_SQUISH_CYCLE_LEN; }
-    squish = SS_SQUISH_CYCLE[ssSqFrame];
   }
 
   // Draw main mascot (Claude orange) on top
@@ -520,38 +581,170 @@ void drawNyanFrame() {
   fb.pushSprite(0, 0);
 }
 
+void drawDriftFrame() {
+  // Draw star background into fb, push to TFT first
+  fb.fillSprite(TFT_BLACK);
+  for (int l = 0; l < STAR_LAYERS; l++) {
+    for (int i = 0; i < STARS_PER_LAYER; i++) {
+      ssStars[l][i].x -= STAR_SPEED[l];
+      if (ssStars[l][i].x < 0) ssStars[l][i].x += 240.0f;
+      uint16_t col = (random(0, 20) == 0) ? dimColor(STAR_BRIGHT[l], 0.3f) : STAR_BRIGHT[l];
+      fb.fillRect((int)ssStars[l][i].x, ssStars[l][i].y, STAR_SIZE[l], STAR_SIZE[l], col);
+    }
+  }
+  // Build mascot sprite at scaled pixel size
+  int psw = max(1, (int)(4.0f * ssDriftScale));
+  int psh = max(1, (int)(7.0f * ssDriftScale));
+  int mw  = 14 * psw;
+  int mh  =  5 * psh;
+
+  // Sprite large enough to hold mascot at any rotation angle
+  int sprSz = (int)(sqrtf((float)(mw*mw + mh*mh))) + 4;
+  TFT_eSprite tmp = TFT_eSprite(&tft);
+  tmp.createSprite(sprSz, sprSz);
+  tmp.fillSprite(TFT_BLACK);
+
+  // Draw mascot centered in tmp sprite
+  int ox = (sprSz - mw) / 2;
+  int oy = (sprSz - mh) / 2;
+  uint16_t col = parseColor("#D97757");
+  struct { int c, r; } body[] = {
+    {2,0},{3,0},{4,0},{5,0},{6,0},{7,0},{8,0},{9,0},{10,0},{11,0},
+    {2,1},{3,1},{4,1},{5,1},{6,1},{7,1},{8,1},{9,1},{10,1},{11,1},
+    {0,2},{1,2},{2,2},{3,2},{4,2},{5,2},{6,2},{7,2},{8,2},{9,2},{10,2},{11,2},{12,2},{13,2},
+    {2,3},{3,3},{4,3},{5,3},{6,3},{7,3},{8,3},{9,3},{10,3},{11,3},
+    {3,4},{5,4},{8,4},{10,4}
+  };
+  struct { int c, r; } eyes[] = {{4,1},{9,1}};
+  for (auto& b : body) tmp.fillRect(ox + b.c*psw, oy + b.r*psh, psw, psh, col);
+  for (auto& e : eyes) tmp.fillRect(ox + e.c*psw+1, oy + e.r*psh+1, psw-2, psh-2, TFT_BLACK);
+
+  // Composite rotated Claude into fb (sprite-to-sprite), then push fb once — no flicker
+  tmp.setPivot(sprSz / 2, sprSz / 2);
+  fb.setPivot((int)ssX + MASCOT_W/2, (int)ssY + MASCOT_H/2);
+  tmp.pushRotated(&fb, (int)ssDriftAngle, TFT_BLACK);
+  tmp.deleteSprite();
+
+  fb.pushSprite(0, 0);  // single push — stars + Claude together
+}
+
+void redrawHeaderNow() {
+  if (ssActive || hdrProject[0] == '\0') return;
+  // Use a sprite for the full header text area — clears artifacts and redraws cleanly
+  const int SPR_W = HDR_TEXT_W + 20;
+  TFT_eSprite hdr = TFT_eSprite(&tft);
+  hdr.createSprite(SPR_W, HDR_H);
+  hdr.fillSprite(TFT_BLACK);
+  hdr.setTextSize(2); hdr.setTextFont(2);
+  hdr.setTextColor(parseColor("#7B68EE"), TFT_BLACK);
+
+  if (hdrNeedsScroll) {
+    // Draw at current scroll position
+    int tx = -(int)hdrScrollX;
+    int gap = HDR_TEXT_W;
+    hdr.setCursor(tx, HDR_TEXT_Y);
+    hdr.print(hdrProject);
+    hdr.setCursor(tx + hdrTextPxW + gap, HDR_TEXT_Y);
+    hdr.print(hdrProject);
+  } else {
+    // Truncated static
+    char truncated[64];
+    strncpy(truncated, hdrProject, 63); truncated[63] = '\0';
+    int len = strlen(truncated);
+    hdr.setTextSize(2); hdr.setTextFont(2);
+    while (len > 0 && hdr.textWidth(truncated) > HDR_TEXT_W) truncated[--len] = '\0';
+    hdr.setCursor(0, HDR_TEXT_Y);
+    hdr.print(truncated);
+  }
+
+  hdr.pushSprite(HDR_ICON_W, 0, 0, 0, HDR_TEXT_W, HDR_H);
+  hdr.deleteSprite();
+}
+
+void tickHeader() {
+  if (!hdrNeedsScroll || !hdrScrollEnabled || ssActive || hdrProject[0] == '\0') return;
+  unsigned long now = millis();
+  if (now - hdrLastScrollMs < HDR_SCROLL_MS) return;
+  hdrLastScrollMs = now;
+
+  // Advance scroll — loop period = text width + full window width so second copy
+  // only enters from the right edge column-by-column once first copy is gone
+  hdrScrollX += 1.0f;
+  int gap = HDR_TEXT_W;  // gap = full text area width ensures clean right-edge entry
+  if (hdrScrollX >= hdrTextPxW + gap) hdrScrollX = 0.0f;
+
+  // Sprite wider than visible area so characters partially off the right edge render fully
+  // then we push only the visible HDR_TEXT_W columns — gives smooth pixel-column entry
+  const int SPR_W = HDR_TEXT_W + 20;
+  TFT_eSprite hdr = TFT_eSprite(&tft);
+  hdr.createSprite(SPR_W, HDR_H);
+  hdr.fillSprite(TFT_BLACK);
+  hdr.setTextSize(2); hdr.setTextFont(2);
+  hdr.setTextColor(parseColor("#7B68EE"), TFT_BLACK);
+
+  int tx = -(int)hdrScrollX;
+  hdr.setCursor(tx, HDR_TEXT_Y);
+  hdr.print(hdrProject);
+  hdr.setCursor(tx + hdrTextPxW + gap, HDR_TEXT_Y);
+  hdr.print(hdrProject);
+
+  // Push only the visible portion (left HDR_TEXT_W columns) to screen
+  hdr.pushSprite(HDR_ICON_W, 0, 0, 0, HDR_TEXT_W, HDR_H);
+  hdr.deleteSprite();
+}
+
 void tickScreensaver() {
   unsigned long now = millis();
   if (now - ssLastFrameMs < SS_FRAME_MS) return;
   ssLastFrameMs = now;
 
-  // Sample position into trail buffer every N frames for visible spacing
-  ssSampleTick++;
-  if (ssSampleTick >= TRAIL_SAMPLE) {
-    ssSampleTick = 0;
-    ssTrail[ssTrailHead] = {(int)ssX, (int)ssY};
-    ssTrailHead = (ssTrailHead + 1) % TRAIL_SEGS;
-    if (ssTrailHead == 0) ssTrailFull = true;
+  if (ssMode == SS_NYAN) {
+    // Sample position into trail buffer every N frames for visible spacing
+    ssSampleTick++;
+    if (ssSampleTick >= TRAIL_SAMPLE) {
+      ssSampleTick = 0;
+      ssTrail[ssTrailHead] = {(int)ssX, (int)ssY, RAINBOW[ssColorOff % RAINBOW_BANDS]};
+      ssColorOff = (ssColorOff + 1) % RAINBOW_BANDS;
+      ssTrailHead = (ssTrailHead + 1) % TRAIL_SEGS;
+      if (ssTrailHead == 0) ssTrailFull = true;
+    }
   }
 
-  // Advance color offset every 2 frames
-  static int ssColorTick = 0;
-  if (++ssColorTick >= 2) { ssColorTick = 0; ssColorOff = (ssColorOff + 1) % RAINBOW_BANDS; }
-
-  // Move
+  // Move (shared)
   ssX += ssDx;
   ssY += ssDy;
 
-  // Bounce
-  if (ssX <= 0)              { ssX = 0;               ssDx = fabsf(ssDx);  ssBounceFrames = SS_BOUNCE_LEN; }
-  if (ssX >= 240 - MASCOT_W) { ssX = 240 - MASCOT_W;  ssDx = -fabsf(ssDx); ssBounceFrames = SS_BOUNCE_LEN; }
-  if (ssY <= 0)              { ssY = 0;               ssDy = fabsf(ssDy);  ssBounceFrames = SS_BOUNCE_LEN; }
-  if (ssY >= 240 - MASCOT_H) { ssY = 240 - MASCOT_H;  ssDy = -fabsf(ssDy); ssBounceFrames = SS_BOUNCE_LEN; }
+  // Bounce — shared, but drift mode also updates depth on each bounce
+  bool bounced = false;
+  if (ssX <= 0)              { ssX = 0;               ssDx = fabsf(ssDx);  ssBounceFrames = SS_BOUNCE_LEN; bounced = true; }
+  if (ssX >= 240 - MASCOT_W) { ssX = 240 - MASCOT_W;  ssDx = -fabsf(ssDx); ssBounceFrames = SS_BOUNCE_LEN; bounced = true; }
+  if (ssY <= 0)              { ssY = 0;               ssDy = fabsf(ssDy);  ssBounceFrames = SS_BOUNCE_LEN; bounced = true; }
+  if (ssY >= 240 - MASCOT_H) { ssY = 240 - MASCOT_H;  ssDy = -fabsf(ssDy); ssBounceFrames = SS_BOUNCE_LEN; bounced = true; }
 
-  drawNyanFrame();
+  if (ssMode == SS_DRIFT && bounced) {
+    ssBounceCount++;
+    int limit = (ssDriftDir < 0) ? DRIFT_SHRINK_BOUNCES : DRIFT_GROW_BOUNCES;
+    if (ssBounceCount >= limit) {
+      ssBounceCount = 0;
+      ssDriftDir    = -ssDriftDir;  // flip direction
+    }
+  }
+
+  if (ssMode == SS_DRIFT) {
+    // Advance rotation and depth smoothly each frame
+    ssDriftAngle += 2.5f;
+    if (ssDriftAngle >= 360.0f) ssDriftAngle -= 360.0f;
+    float step = (DRIFT_SCALE_MAX - DRIFT_SCALE_MIN) / (DRIFT_GROW_BOUNCES * 30.0f);
+    ssDriftScale += ssDriftDir * step;
+    ssDriftScale  = max(DRIFT_SCALE_MIN, min(DRIFT_SCALE_MAX, ssDriftScale));
+    drawDriftFrame();
+  } else {
+    drawNyanFrame();
+  }
 }
 
-void startScreensaver() {
+void startScreensaver(SsMode mode = SS_NYAN) {
+  ssMode         = mode;
   ssActive       = true;
   ssTrailHead    = 0;
   ssTrailFull    = false;
@@ -560,14 +753,21 @@ void startScreensaver() {
   ssSqFrame      = 0;
   ssSqTick       = 0;
   ssBounceFrames = 0;
+  ssBounceCount  = 0;
+  ssDriftDir     = -1;      // start by going away (shrinking)
+  ssDriftScale   = DRIFT_SCALE_MAX;  // start at full size
 
-  // Scatter stars randomly across the screen
-  for (int i = 0; i < STAR_COUNT; i++) {
-    ssStars[i].x   = random(0, 238);
-    ssStars[i].y   = random(0, 238);
-    // Stars twinkle between white and light grey
-    ssStars[i].col = (random(0, 2) == 0) ? TFT_WHITE : 0xC618;
+  // Scatter stars across all layers
+  for (int l = 0; l < STAR_LAYERS; l++) {
+    for (int i = 0; i < STARS_PER_LAYER; i++) {
+      ssStars[l][i].x = (float)random(0, 240);
+      ssStars[l][i].y = random(0, 240);
+    }
   }
+
+  // UFO: start inactive, first flyby after 15–35s
+  ssUfo.active  = false;
+  ssUfoNextMs   = millis() + 15000 + random(0, 20000);
 
   fb.fillSprite(TFT_BLACK);
   fb.pushSprite(0, 0);
@@ -582,11 +782,38 @@ void drawDashboardFrame(const char* project, const char* model,
                         int turns, int ctx_used, int ctx_max) {
   fb.fillSprite(TFT_BLACK);
 
-  // Header
-  char header[17]; strncpy(header, project[0] ? project : "Claude Session", 16); header[16] = '\0';
-  fb.setTextColor(parseColor("#7B68EE"), TFT_BLACK);
+  // Header — folder icon + project name
+  // Folder icon (~18x14px) centered vertically in HDR_H=28 row, at x=5
+  uint16_t folderCol  = parseColor("#F0A030");
+  uint16_t folderDark = parseColor("#C07820");
+  fb.fillRect(5,  14, 18, 11, folderCol);   // main body
+  fb.fillRect(5,  11,  8,  4, folderCol);   // tab top-left
+  fb.fillRect(5,  14, 18,  1, folderDark);  // shadow line top of body
+
+  // Store project for scroll ticker
+  strncpy(hdrProject, project[0] ? project : "Claude Session", 63);
+  hdrProject[63] = '\0';
+
+  // Measure text width to decide static vs scroll
   fb.setTextSize(2); fb.setTextFont(2);
-  fb.setCursor(10, 8); fb.print(header);
+  hdrTextPxW     = fb.textWidth(hdrProject);
+  hdrNeedsScroll = (hdrTextPxW > HDR_TEXT_W) && hdrScrollEnabled;
+  hdrScrollX     = 0.0f;
+
+  // Draw initial header text
+  fb.setTextColor(parseColor("#7B68EE"), TFT_BLACK);
+  if (!hdrNeedsScroll) {
+    // Truncate string to fit — remove chars from the end until it fits
+    char truncated[64];
+    strncpy(truncated, hdrProject, 63); truncated[63] = '\0';
+    int len = strlen(truncated);
+    while (len > 0 && fb.textWidth(truncated) > HDR_TEXT_W) {
+      truncated[--len] = '\0';
+    }
+    fb.setCursor(HDR_ICON_W, HDR_TEXT_Y);
+    fb.print(truncated);
+  }
+  // scrolling version drawn by tickHeader()
 
   // Labels
   fb.setTextColor(parseColor("#666666"), TFT_BLACK);
@@ -762,6 +989,16 @@ void setup() {
   String pass = prefs.getString("pass", "");
   prefs.end();
 
+  // Load display preferences from NVS
+  prefs.begin("display", true);
+  String savedMode  = prefs.getString("ssmode",   "nyan");
+  int    savedIdle  = prefs.getInt("ssidle",      5);     // minutes, 0 = never
+  bool   savedScroll = prefs.getBool("hdrscroll", true);
+  prefs.end();
+  ssMode         = (savedMode == "drift") ? SS_DRIFT : (savedMode == "off") ? SS_OFF : SS_NYAN;
+  ssIdleMs       = (savedIdle > 0) ? (unsigned long)savedIdle * 60 * 1000 : 0;
+  hdrScrollEnabled = savedScroll;
+
   // Try STA connection only if we have creds
   if (ssid.length() > 0) {
     WiFi.mode(WIFI_STA);
@@ -893,7 +1130,14 @@ void setup() {
     ESP.restart();
   });
   server.on("/screensaver", HTTP_POST, []() {
-    startScreensaver();
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String mode = doc["mode"] | "nyan";
+    SsMode newMode = (mode == "drift") ? SS_DRIFT : SS_NYAN;
+    prefs.begin("display", false);
+    prefs.putString("ssmode", mode);
+    prefs.end();
+    startScreensaver(newMode);
     sendOk("screensaver started");
   });
   server.on("/wifi/clear", HTTP_POST, []() {
@@ -903,6 +1147,119 @@ void setup() {
     sendOk("wifi creds cleared, rebooting");
     delay(500);
     ESP.restart();
+  });
+
+  // Settings web UI
+  server.on("/settings", HTTP_GET, []() {
+    String ssidStr, curMode, idleMins;
+    prefs.begin("wifi", true);  ssidStr = prefs.getString("ssid", ""); prefs.end();
+    if (ssMode == SS_DRIFT)     curMode = "drift";
+    else if (ssMode == SS_OFF)  curMode = "off";
+    else                        curMode = "nyan";
+    idleMins = String(ssIdleMs > 0 ? (int)(ssIdleMs / 60000) : 0);
+
+    String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>ESP32 Display Settings</title>"
+      "<style>body{font-family:sans-serif;max-width:480px;margin:20px auto;padding:0 16px;background:#111;color:#eee}"
+      "h1{color:#7B68EE;margin-bottom:4px}h2{color:#aaa;font-size:1em;font-weight:normal;margin-top:0}"
+      ".card{background:#1a1a2e;border-radius:8px;padding:16px;margin:16px 0}"
+      ".card h3{margin:0 0 12px;color:#7B68EE;font-size:0.95em;text-transform:uppercase;letter-spacing:1px}"
+      "label{display:block;margin:8px 0 4px;color:#aaa;font-size:0.9em}"
+      "input[type=text],input[type=password],input[type=number]{width:100%;padding:8px;box-sizing:border-box;"
+      "background:#0d0d1a;border:1px solid #333;color:#eee;border-radius:4px}"
+      ".radio-group label{display:inline-flex;align-items:center;gap:6px;margin-right:16px;color:#eee}"
+      "button,input[type=submit]{background:#7B68EE;color:#fff;border:none;padding:10px 20px;"
+      "border-radius:4px;cursor:pointer;font-size:0.95em;margin-top:8px}"
+      "button.danger{background:#c0392b}"
+      ".status{font-size:0.85em;color:#888;margin-bottom:0}"
+      ".status span{color:#5DADE2}</style></head><body>"
+      "<h1>ESP32 Display</h1>"
+      "<p class='status'>v<span>" FW_VERSION "</span> &nbsp;|&nbsp; IP: <span>" + WiFi.localIP().toString() + "</span>"
+      " &nbsp;|&nbsp; RSSI: <span>" + String(WiFi.RSSI()) + " dBm</span>"
+      " &nbsp;|&nbsp; Free heap: <span>" + String(ESP.getFreeHeap()/1024) + " KB</span></p>"
+
+      "<form method='POST' action='/settings'>"
+
+      "<div class='card'><h3>Screensaver</h3>"
+      "<label>Mode</label>"
+      "<div class='radio-group'>"
+      "<label><input type='radio' name='ssmode' value='nyan'" + String(curMode=="nyan"?" checked":"") + "> Nyan</label>"
+      "<label><input type='radio' name='ssmode' value='drift'" + String(curMode=="drift"?" checked":"") + "> Drift</label>"
+      "<label><input type='radio' name='ssmode' value='off'" + String(curMode=="off"?" checked":"") + "> Disabled</label>"
+      "</div>"
+      "<label>Idle timeout (minutes, 0 = never)</label>"
+      "<input type='number' name='ssidle' min='0' max='60' value='" + idleMins + "'>"
+      "</div>"
+
+      "<div class='card'><h3>Header</h3>"
+      "<label>Long folder names</label>"
+      "<div class='radio-group'>"
+      "<label><input type='radio' name='hdrscroll' value='1'" + String(hdrScrollEnabled?" checked":"") + "> Scroll</label>"
+      "<label><input type='radio' name='hdrscroll' value='0'" + String(!hdrScrollEnabled?" checked":"") + "> Truncate</label>"
+      "</div></div>"
+
+      "<div class='card'><h3>WiFi</h3>"
+      "<label>Current SSID: <span style='color:#5DADE2'>" + ssidStr + "</span></label>"
+      "<label>New SSID</label><input type='text' name='ssid' placeholder='leave blank to keep current'>"
+      "<label>Password</label><input type='password' name='pass' placeholder='leave blank to keep current'>"
+      "</div>"
+
+      "<input type='submit' value='Save Settings'>"
+      "</form>"
+
+      "<div class='card'><h3>Danger Zone</h3>"
+      "<form method='POST' action='/wifi/clear'>"
+      "<button class='danger' type='submit'>Clear WiFi &amp; Reboot to AP Mode</button>"
+      "</form></div>"
+
+      "<div class='card'><h3>Firmware</h3>"
+      "<a href='/update' style='color:#7B68EE'>OTA Firmware Update</a></div>"
+
+      "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/settings", HTTP_POST, []() {
+    // Screensaver mode
+    String newSsMode = server.arg("ssmode");
+    if (newSsMode == "drift")     ssMode = SS_DRIFT;
+    else if (newSsMode == "off")  ssMode = SS_OFF;
+    else                          { ssMode = SS_NYAN; newSsMode = "nyan"; }
+
+    // Idle timeout
+    int newIdle = server.arg("ssidle").toInt();
+    ssIdleMs = (newIdle > 0) ? (unsigned long)newIdle * 60 * 1000 : 0;
+
+    // Header scroll
+    hdrScrollEnabled = (server.arg("hdrscroll") == "1");
+    hdrScrollX       = 0.0f;
+    hdrNeedsScroll   = (hdrTextPxW > HDR_TEXT_W) && hdrScrollEnabled;
+    redrawHeaderNow();
+
+    // WiFi (only update if new ssid provided)
+    String newSsid = server.arg("ssid");
+    String newPass = server.arg("pass");
+
+    prefs.begin("display", false);
+    prefs.putString("ssmode",    newSsMode);
+    prefs.putInt("ssidle",       newIdle);
+    prefs.putBool("hdrscroll",   hdrScrollEnabled);
+    prefs.end();
+
+    if (newSsid.length() > 0) {
+      prefs.begin("wifi", false);
+      prefs.putString("ssid", newSsid);
+      prefs.putString("pass", newPass);
+      prefs.end();
+      server.sendHeader("Location", "/settings");
+      server.send(303);
+      delay(500);
+      ESP.restart();
+      return;
+    }
+
+    server.sendHeader("Location", "/settings");
+    server.send(303);
   });
 
   // OTA: POST firmware binary to /update, or GET /update for upload page
@@ -939,10 +1296,14 @@ void loop() {
     server.handleClient();
   }
 
-  // Auto-start screensaver after idle timeout
-  if (!ssActive && (millis() > SS_IDLE_MS) && (lastDashboardMs == 0 || (millis() - lastDashboardMs > SS_IDLE_MS))) {
-    startScreensaver();
+  // Auto-start screensaver after idle timeout (skip if disabled or SS_OFF)
+  if (!ssActive && ssMode != SS_OFF && ssIdleMs > 0) {
+    if ((millis() > ssIdleMs) && (lastDashboardMs == 0 || (millis() - lastDashboardMs > ssIdleMs))) {
+      startScreensaver(ssMode);
+    }
   }
+
+  tickHeader();
 
   if (ssActive) {
     tickScreensaver();
