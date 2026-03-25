@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """MCP server that exposes the ESP32 display as tools Claude can use."""
 
+import os
 import sys
 import logging
 import requests
 from mcp.server.fastmcp import FastMCP
+
+PAUSE_FLAG_PATH = "/tmp/esp32_display_paused"
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
@@ -159,6 +162,24 @@ def display_status() -> str:
         return r.text
     except Exception as e:
         return f"Error: {e}"
+
+
+@mcp.tool()
+def pause_display() -> str:
+    """Pause automatic dashboard updates from the Stop hook so drawings persist on screen.
+    The display can still be drawn to manually. Call resume_display() to restore normal updates."""
+    open(PAUSE_FLAG_PATH, "w").close()
+    return "Dashboard updates paused. Use resume_display() to restore."
+
+
+@mcp.tool()
+def resume_display() -> str:
+    """Resume automatic dashboard updates from the Stop hook after a pause."""
+    try:
+        os.remove(PAUSE_FLAG_PATH)
+    except FileNotFoundError:
+        pass
+    return "Dashboard updates resumed."
 
 
 def main():

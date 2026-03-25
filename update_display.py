@@ -11,7 +11,8 @@ import urllib.request
 
 ESP32_MDNS = "esp32-display.local"
 ESP32_IP   = "192.168.68.75"   # fallback if mDNS fails
-PREV_STATS_PATH = "/tmp/claude_display_prev.json"
+PREV_STATS_PATH  = "/tmp/claude_display_prev.json"
+PAUSE_FLAG_PATH  = "/tmp/esp32_display_paused"
 
 # Pricing per million tokens by model prefix
 MODEL_PRICING = {
@@ -179,6 +180,9 @@ def main():
 
     cwd = hook_input.get("cwd", "")
     project = os.path.basename(cwd) if cwd else ""
+
+    if os.path.exists(PAUSE_FLAG_PATH):
+        return  # dashboard updates paused
 
     stats = get_stats(transcript_path)
     send_to_display(stats, project)
