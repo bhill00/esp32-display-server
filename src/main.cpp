@@ -37,7 +37,7 @@ bool          hdrNeedsScroll   = false;
 float         hdrScrollX       = 0.0f;  // current scroll offset (0 = start)
 unsigned long hdrLastScrollMs  = 0;
 
-enum SsMode { SS_NYAN, SS_DRIFT, SS_OFF };
+enum SsMode { SS_NYAN, SS_DRIFT, SS_INVADERS, SS_RANDOM, SS_OFF };
 SsMode ssMode       = SS_NYAN;
 unsigned long ssIdleMs    = 5UL * 60 * 1000;  // idle timeout, 0 = never
 bool          hdrScrollEnabled = true;          // false = truncate long names
@@ -93,6 +93,57 @@ Star ssStars[STAR_LAYERS][STARS_PER_LAYER];
 struct Ufo { float x; int y; bool active; float speed; };
 Ufo ssUfo = { 0, 0, false, 0 };
 unsigned long ssUfoNextMs = 0;  // when to spawn next UFO
+
+// ---- Space Invaders screensaver ----
+#define INV_COLS       8
+#define INV_ROWS       4
+#define INV_SCALE      0.45f          // mascot pixel size
+#define INV_W          13             // alien width at scale (14*0.45 rounded)
+#define INV_H          10             // alien height at scale (5*7*0.45 rounded... padded)
+#define INV_XGAP       26             // horizontal spacing between alien centers
+#define INV_YGAP       18             // vertical spacing
+#define INV_XSTART     14             // left edge of grid
+#define INV_YSTART     18             // top edge of grid
+#define INV_MAX_ABULS  3              // max alien bullets active at once
+#define INV_PLAYER_Y   226            // player ship y position
+#define INV_PLAYER_W   16             // player ship width
+#define INV_BULLET_SPD 4              // player bullet speed (px/frame)
+#define INV_ABUL_SPD   2              // alien bullet speed
+
+bool     invAlive[INV_ROWS][INV_COLS];
+float    invGridX   = 0.0f;   // grid x offset from start
+int      invGridY   = 0;      // grid y offset from start
+float    invDx      = 0.4f;   // current horizontal step per frame
+bool     invMoving  = true;
+int      invAliveCount = INV_ROWS * INV_COLS;
+int      invScore      = 0;
+bool     invGameOver   = false;
+int      invGameOverFrames = 0;  // countdown before reset
+
+float    invPlayerX = 112.0f; // player ship center x
+int      invPlayerLives = 3;
+bool     invPlayerHit   = false;
+int      invPlayerHitFrames = 0;
+
+// Player bullet
+bool     invBulActive = false;
+float    invBulX = 0, invBulY = 0;
+
+// Alien bullets
+struct InvBul { float x, y; bool active; };
+InvBul   invAbuls[INV_MAX_ABULS];
+
+int      invFireTick  = 0;    // countdown to next alien fire
+int      invAiTick    = 0;    // AI movement tick
+int      invWavePause = 0;    // frames to pause after wave clear
+
+// Row colors
+static const uint16_t INV_ROW_COLOR[INV_ROWS] = {
+  0xF800,  // red    — top row
+  0xFC60,  // orange
+  0x07E0,  // green
+  0x001F,  // blue   — bottom row
+};
 
 // Rainbow stripe colors (RGB565) — R,O,Y,G,B,V
 static const uint16_t RAINBOW[RAINBOW_BANDS] = {
@@ -516,6 +567,7 @@ void drawMascotAt(int ox, int oy, int squish, uint16_t col = 0, bool clearBg = t
 void drawMascot(int squish) { drawMascotAt(170, 48, squish); }
 
 // ---- Screensaver ----
+void drawInvadersFrame();  // forward declaration
 
 void drawNyanFrame() {
   fb.fillSprite(TFT_BLACK);
@@ -738,12 +790,230 @@ void tickScreensaver() {
     ssDriftScale += ssDriftDir * step;
     ssDriftScale  = max(DRIFT_SCALE_MIN, min(DRIFT_SCALE_MAX, ssDriftScale));
     drawDriftFrame();
+  } else if (ssMode == SS_INVADERS) {
+    drawInvadersFrame();
   } else {
     drawNyanFrame();
   }
 }
 
+void invReset() {
+  for (int r = 0; r < INV_ROWS; r++)
+    for (int c = 0; c < INV_COLS; c++)
+      invAlive[r][c] = true;
+  invAliveCount    = INV_ROWS * INV_COLS;
+  invGridX         = 0.0f;
+  invGridY         = 0;
+  invDx            = 0.4f;
+  invScore         = 0;
+  invGameOver      = false;
+  invGameOverFrames = 0;
+  invBulActive     = false;
+  invPlayerLives   = 3;
+  invPlayerHit     = false;
+  invPlayerHitFrames = 0;
+  invPlayerX       = 112.0f;
+  invFireTick      = 40;
+  invAiTick        = 0;
+  invWavePause     = 0;
+  for (int i = 0; i < INV_MAX_ABULS; i++) invAbuls[i].active = false;
+}
+
+void drawInvadersFrame() {
+  fb.fillSprite(TFT_BLACK);
+
+  // --- Game over screen ---
+  if (invGameOver) {
+    fb.setTextSize(2); fb.setTextFont(1);
+    fb.setTextColor(TFT_WHITE, TFT_BLACK);
+    fb.setCursor(68, 95);  fb.print("GAME");
+    fb.setCursor(68, 115); fb.print("OVER");
+    fb.setTextSize(1); fb.setTextFont(1);
+    char sbuf[20]; sprintf(sbuf, "Score: %d", invScore);
+    fb.setCursor(72, 140); fb.print(sbuf);
+    fb.pushSprite(0, 0);
+    invGameOverFrames--;
+    if (invGameOverFrames <= 0) { invGameOver = false; invReset(); }
+    return;
+  }
+
+  if (invWavePause > 0) {
+    invWavePause--;
+    if (invWavePause == 0) invReset();
+    fb.pushSprite(0, 0);
+    return;
+  }
+
+  // --- Move grid ---
+  invGridX += invDx;
+  // Find leftmost and rightmost alive column
+  int leftCol = INV_COLS, rightCol = -1;
+  for (int r = 0; r < INV_ROWS; r++)
+    for (int c = 0; c < INV_COLS; c++)
+      if (invAlive[r][c]) { leftCol = min(leftCol, c); rightCol = max(rightCol, c); }
+
+  float gridLeft  = INV_XSTART + invGridX + leftCol  * INV_XGAP;
+  float gridRight = INV_XSTART + invGridX + rightCol * INV_XGAP + INV_W;
+  if (gridRight >= 238 || gridLeft <= 2) {
+    invDx = -invDx;
+    invGridY += 8;  // drop down
+  }
+
+  // Speed up as aliens die (base 0.4, up to ~1.6 when nearly cleared)
+  float speedScale = 1.0f + (INV_ROWS * INV_COLS - invAliveCount) * 0.04f;
+  float curDx = (invDx > 0 ? 1.0f : -1.0f) * 0.4f * speedScale;
+  invDx = curDx;
+
+  // --- Score at top ---
+  fb.setTextSize(1); fb.setTextFont(2);
+  fb.setTextColor(0xFFE0, TFT_BLACK);
+  char scoreBuf[20]; sprintf(scoreBuf, "Score: %d", invScore);
+  fb.setCursor(4, 2); fb.print(scoreBuf);
+
+  // --- Draw aliens ---
+  for (int r = 0; r < INV_ROWS; r++) {
+    for (int c = 0; c < INV_COLS; c++) {
+      if (!invAlive[r][c]) continue;
+      int ax = INV_XSTART + (int)invGridX + c * INV_XGAP;
+      int ay = INV_YSTART + invGridY      + r * INV_YGAP;
+      drawMascotAt(ax, ay, 0, INV_ROW_COLOR[r], false, INV_SCALE);
+    }
+  }
+
+  // --- Alien fire ---
+  invFireTick--;
+  if (invFireTick <= 0 && invAliveCount > 0) {
+    invFireTick = max(10, 50 - (INV_ROWS * INV_COLS - invAliveCount));
+    // Find a random alive alien in bottom-most row of each column
+    int col = random(0, INV_COLS);
+    for (int attempt = 0; attempt < INV_COLS; attempt++) {
+      int c = (col + attempt) % INV_COLS;
+      for (int r = INV_ROWS - 1; r >= 0; r--) {
+        if (invAlive[r][c]) {
+          // Find free bullet slot
+          for (int i = 0; i < INV_MAX_ABULS; i++) {
+            if (!invAbuls[i].active) {
+              invAbuls[i].active = true;
+              invAbuls[i].x = INV_XSTART + (int)invGridX + c * INV_XGAP + INV_W/2;
+              invAbuls[i].y = INV_YSTART + invGridY + r * INV_YGAP + INV_H;
+              break;
+            }
+          }
+          break;
+        }
+      }
+      break;
+    }
+  }
+
+  // Move + draw alien bullets, check player hit
+  for (int i = 0; i < INV_MAX_ABULS; i++) {
+    if (!invAbuls[i].active) continue;
+    invAbuls[i].y += INV_ABUL_SPD;
+    if (invAbuls[i].y > 240) { invAbuls[i].active = false; continue; }
+    fb.fillRect((int)invAbuls[i].x, (int)invAbuls[i].y, 2, 5, 0xF800);
+    // Hit player?
+    if (!invPlayerHit &&
+        invAbuls[i].y >= INV_PLAYER_Y - 4 &&
+        abs((int)invAbuls[i].x - (int)invPlayerX) < INV_PLAYER_W/2 + 2) {
+      invAbuls[i].active = false;
+      invPlayerHit = true;
+      invPlayerHitFrames = 20;
+      invPlayerLives--;
+      if (invPlayerLives <= 0) { invGameOver = true; invGameOverFrames = 120; return; }
+    }
+  }
+
+  if (invPlayerHit) {
+    invPlayerHitFrames--;
+    if (invPlayerHitFrames <= 0) invPlayerHit = false;
+  }
+
+  // --- AI: move player toward lowest alien in nearest column, fire when aligned ---
+  invAiTick++;
+  if (invAiTick >= 1) {
+    invAiTick = 0;
+    // Find lowest alive alien (highest y), use its column as target
+    int targetCol = -1, lowestRow = -1;
+    float bestDist = 9999;
+    for (int c = 0; c < INV_COLS; c++) {
+      for (int r = INV_ROWS - 1; r >= 0; r--) {
+        if (invAlive[r][c]) {
+          float alienX = INV_XSTART + invGridX + c * INV_XGAP + INV_W/2;
+          float dist = fabsf(alienX - invPlayerX);
+          if (r > lowestRow || (r == lowestRow && dist < bestDist)) {
+            lowestRow = r; targetCol = c; bestDist = dist;
+          }
+          break;
+        }
+      }
+    }
+    if (targetCol >= 0) {
+      float targetX = INV_XSTART + invGridX + targetCol * INV_XGAP + INV_W/2;
+      float diff = targetX - invPlayerX;
+      float step = min(fabsf(diff), 2.0f);
+      invPlayerX += (diff > 0 ? step : -step);
+      invPlayerX = max(INV_PLAYER_W/2.0f, min(240.0f - INV_PLAYER_W/2.0f, invPlayerX));
+
+      // Fire if roughly aligned and no active bullet
+      if (!invBulActive && fabsf(diff) < 6.0f) {
+        invBulActive = true;
+        invBulX = invPlayerX;
+        invBulY = INV_PLAYER_Y - 6;
+      }
+    }
+  }
+
+  // --- Player bullet ---
+  if (invBulActive) {
+    invBulY -= INV_BULLET_SPD;
+    if (invBulY < 0) { invBulActive = false; }
+    else {
+      fb.fillRect((int)invBulX - 1, (int)invBulY, 2, 5, 0xFFFF);
+      // Hit alien?
+      for (int r = 0; r < INV_ROWS && invBulActive; r++) {
+        for (int c = 0; c < INV_COLS && invBulActive; c++) {
+          if (!invAlive[r][c]) continue;
+          int ax = INV_XSTART + (int)invGridX + c * INV_XGAP;
+          int ay = INV_YSTART + invGridY      + r * INV_YGAP;
+          if (invBulX >= ax && invBulX <= ax + INV_W &&
+              invBulY >= ay && invBulY <= ay + INV_H) {
+            invAlive[r][c] = false;
+            invAliveCount--;
+            invBulActive = false;
+            invScore += 10 * (INV_ROWS - r);  // top rows worth more
+            if (invAliveCount == 0) { invWavePause = 80; }
+          }
+        }
+      }
+    }
+  }
+
+  // --- Draw player ship ---
+  uint16_t playerCol = invPlayerHit ? 0xF800 : 0x07FF;
+  int px = (int)invPlayerX;
+  fb.fillTriangle(px, INV_PLAYER_Y - 6, px - INV_PLAYER_W/2, INV_PLAYER_Y + 2,
+                  px + INV_PLAYER_W/2, INV_PLAYER_Y + 2, playerCol);
+
+  // --- Lives indicator ---
+  for (int i = 0; i < invPlayerLives; i++)
+    fb.fillTriangle(4 + i*10, 238, 4 + i*10 - 4, 240, 4 + i*10 + 4, 240, 0x07FF);
+
+  // --- Check aliens reached bottom ---
+  for (int r = 0; r < INV_ROWS; r++)
+    for (int c = 0; c < INV_COLS; c++)
+      if (invAlive[r][c] && INV_YSTART + invGridY + r * INV_YGAP + INV_H >= INV_PLAYER_Y - 4)
+        { invGameOver = true; invGameOverFrames = 120; fb.pushSprite(0, 0); return; }
+
+  fb.pushSprite(0, 0);
+}
+
 void startScreensaver(SsMode mode = SS_NYAN) {
+  // Random: pick one of the three real modes
+  if (mode == SS_RANDOM) {
+    const SsMode choices[] = { SS_NYAN, SS_DRIFT, SS_INVADERS };
+    mode = choices[random(0, 3)];
+  }
   ssMode         = mode;
   ssActive       = true;
   ssTrailHead    = 0;
@@ -768,6 +1038,9 @@ void startScreensaver(SsMode mode = SS_NYAN) {
   // UFO: start inactive, first flyby after 15–35s
   ssUfo.active  = false;
   ssUfoNextMs   = millis() + 15000 + random(0, 20000);
+
+  // Invaders: reset game state
+  if (mode == SS_INVADERS) invReset();
 
   fb.fillSprite(TFT_BLACK);
   fb.pushSprite(0, 0);
@@ -995,7 +1268,7 @@ void setup() {
   int    savedIdle  = prefs.getInt("ssidle",      5);     // minutes, 0 = never
   bool   savedScroll = prefs.getBool("hdrscroll", true);
   prefs.end();
-  ssMode         = (savedMode == "drift") ? SS_DRIFT : (savedMode == "off") ? SS_OFF : SS_NYAN;
+  ssMode         = (savedMode == "drift") ? SS_DRIFT : (savedMode == "invaders") ? SS_INVADERS : (savedMode == "random") ? SS_RANDOM : (savedMode == "off") ? SS_OFF : SS_NYAN;
   ssIdleMs       = (savedIdle > 0) ? (unsigned long)savedIdle * 60 * 1000 : 0;
   hdrScrollEnabled = savedScroll;
 
@@ -1133,7 +1406,7 @@ void setup() {
     JsonDocument doc;
     deserializeJson(doc, server.arg("plain"));
     String mode = doc["mode"] | "nyan";
-    SsMode newMode = (mode == "drift") ? SS_DRIFT : SS_NYAN;
+    SsMode newMode = (mode == "drift") ? SS_DRIFT : (mode == "invaders") ? SS_INVADERS : (mode == "random") ? SS_RANDOM : SS_NYAN;
     prefs.begin("display", false);
     prefs.putString("ssmode", mode);
     prefs.end();
@@ -1153,9 +1426,11 @@ void setup() {
   server.on("/settings", HTTP_GET, []() {
     String ssidStr, curMode, idleMins;
     prefs.begin("wifi", true);  ssidStr = prefs.getString("ssid", ""); prefs.end();
-    if (ssMode == SS_DRIFT)     curMode = "drift";
-    else if (ssMode == SS_OFF)  curMode = "off";
-    else                        curMode = "nyan";
+    if (ssMode == SS_DRIFT)         curMode = "drift";
+    else if (ssMode == SS_INVADERS) curMode = "invaders";
+    else if (ssMode == SS_RANDOM)   curMode = "random";
+    else if (ssMode == SS_OFF)      curMode = "off";
+    else                            curMode = "nyan";
     idleMins = String(ssIdleMs > 0 ? (int)(ssIdleMs / 60000) : 0);
 
     String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -1185,6 +1460,8 @@ void setup() {
       "<div class='radio-group'>"
       "<label><input type='radio' name='ssmode' value='nyan'" + String(curMode=="nyan"?" checked":"") + "> Nyan</label>"
       "<label><input type='radio' name='ssmode' value='drift'" + String(curMode=="drift"?" checked":"") + "> Drift</label>"
+      "<label><input type='radio' name='ssmode' value='invaders'" + String(curMode=="invaders"?" checked":"") + "> Invaders</label>"
+      "<label><input type='radio' name='ssmode' value='random'" + String(curMode=="random"?" checked":"") + "> Random</label>"
       "<label><input type='radio' name='ssmode' value='off'" + String(curMode=="off"?" checked":"") + "> Disabled</label>"
       "</div>"
       "<label>Idle timeout (minutes, 0 = never)</label>"
@@ -1222,9 +1499,11 @@ void setup() {
   server.on("/settings", HTTP_POST, []() {
     // Screensaver mode
     String newSsMode = server.arg("ssmode");
-    if (newSsMode == "drift")     ssMode = SS_DRIFT;
-    else if (newSsMode == "off")  ssMode = SS_OFF;
-    else                          { ssMode = SS_NYAN; newSsMode = "nyan"; }
+    if (newSsMode == "drift")          ssMode = SS_DRIFT;
+    else if (newSsMode == "invaders")  ssMode = SS_INVADERS;
+    else if (newSsMode == "random")    ssMode = SS_RANDOM;
+    else if (newSsMode == "off")       ssMode = SS_OFF;
+    else                               { ssMode = SS_NYAN; newSsMode = "nyan"; }
 
     // Idle timeout
     int newIdle = server.arg("ssidle").toInt();

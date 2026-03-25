@@ -18,10 +18,12 @@ After every Claude Code response, the display updates with:
 
 ### Screensavers
 
-Two screensaver modes trigger after a configurable idle timeout (default 5 minutes):
+Four screensaver modes trigger after a configurable idle timeout (default 5 minutes):
 
 - **Nyan** — Claude bounces around the screen DVD-logo style with a fixed-length rainbow ghost trail, parallax starfield, and random UFO flybys
 - **Drift** — Claude tumbles through space with continuous rotation and depth scaling (bounces toward/away from you in a 3D illusion)
+- **Invaders** — Space Invaders with an AI player: Claude mascots march in formation while the ship shoots them down for points
+- **Random** — picks a different screensaver at random each time idle triggers
 
 Screensaver mode, idle timeout, and all display preferences are configurable via the web UI at `http://esp32-display.local/settings`.
 
@@ -79,7 +81,7 @@ No toolchain needed. Grab the latest merged binary from the `releases/` folder a
 1. Connect ESP32-S3 via USB
 2. Open [https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)
 3. **Erase flash** first
-4. Flash `releases/firmware-5.1-nyan-merged.bin` at address `0x0`
+4. Flash `releases/firmware-5.4-nyan-merged.bin` at address `0x0`
 5. Unplug USB (important — usbipd can prevent boot on WSL2)
 6. Power on — the display will show WiFi setup instructions
 
@@ -160,7 +162,7 @@ Visit `http://esp32-display.local/settings` in any browser to configure:
 
 | Setting | Options |
 |---------|---------|
-| Screensaver mode | Nyan / Drift / Disabled |
+| Screensaver mode | Nyan / Drift / Invaders / Random / Disabled |
 | Idle timeout | Minutes (0 = never) |
 | Long folder names | Scroll / Truncate |
 | WiFi credentials | SSID + password |
